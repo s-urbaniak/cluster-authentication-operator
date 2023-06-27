@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"k8s.io/apimachinery/pkg/api/equality"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"reflect"
 	"testing"
 
@@ -258,101 +260,136 @@ func Test_randomBits(t *testing.T) {
 }
 
 func Test_ensureOAuthClient(t *testing.T) {
+	var reactorErrorFunc = func(action clienttesting.Action) (handled bool, ret runtime.Object, err error) {
+		return true, nil, fmt.Errorf("%s %s fake error", action.GetVerb(), action.GetResource().Resource)
+	}
+
+	newFakeOauthClientClient := func(init func(*fakeoauthclient.Clientset)) *fakeoauthclient.Clientset {
+		fakeClientset := fakeoauthclient.NewSimpleClientset()
+		if init != nil {
+			init(fakeClientset)
+		}
+		return fakeClientset
+	}
+
 	tests := []struct {
 		name              string
-		oauthClient       oauthv1.OAuthClient
+		oauthClient       *oauthv1.OAuthClient
 		updateOAuthClient *oauthv1.OAuthClient
 
-		wantCreateErr bool
-		wantGetErr    bool
+		oauthClientClient *fakeoauthclient.Clientset
+
+		wantEnsureErr bool
 		wantUpdateErr bool
 	}{
 		{
-			name:          "invalid-oauth-client-missing-name-grant-method",
-			oauthClient:   oauthv1.OAuthClient{},
-			wantCreateErr: true,
+			name:        "invalid-oauth-client-missing-name-grant-method",
+			oauthClient: &oauthv1.OAuthClient{},
+			oauthClientClient: newFakeOauthClientClient(func(fake *fakeoauthclient.Clientset) {
+				fake.PrependReactor("create", "oauthclients", reactorErrorFunc)
+			}),
+			wantEnsureErr: true,
 		},
 		{
 			name: "invalid-oauth-client-missing-name",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				GrantMethod: oauthv1.GrantHandlerAuto,
 			},
-			wantCreateErr: true,
+			oauthClientClient: newFakeOauthClientClient(func(fake *fakeoauthclient.Clientset) {
+				fake.PrependReactor("create", "oauthclients", reactorErrorFunc)
+			}),
+			wantEnsureErr: true,
 		},
 		{
 			name: "invalid-oauth-client-missing-grant-method",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta: metav1.ObjectMeta{Name: "invalid-client"},
 			},
-			wantCreateErr: true,
+			oauthClientClient: newFakeOauthClientClient(func(fake *fakeoauthclient.Clientset) {
+				fake.PrependReactor("create", "oauthclients", reactorErrorFunc)
+			}),
+			wantEnsureErr: true,
 		},
 		{
 			name: "valid-oauth-client-already-exists-get-error",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta:  metav1.ObjectMeta{Name: "already-exists-get-error"},
 				GrantMethod: oauthv1.GrantHandlerAuto,
 			},
 			updateOAuthClient: &oauthv1.OAuthClient{
+				ObjectMeta:  metav1.ObjectMeta{Name: "already-exists-get-error"},
 				GrantMethod: oauthv1.GrantHandlerAuto,
 			},
-			wantGetErr: true,
+			oauthClientClient: newFakeOauthClientClient(func(fake *fakeoauthclient.Clientset) {
+				fake.PrependReactor("get", "oauthclients", reactorErrorFunc)
+			}),
+			wantUpdateErr: true,
 		},
 		{
 			name: "valid-oauth-client-already-exists-update-error",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta:  metav1.ObjectMeta{Name: "already-exists-update-error"},
 				GrantMethod: oauthv1.GrantHandlerAuto,
 			},
 			updateOAuthClient: &oauthv1.OAuthClient{
+				ObjectMeta:  metav1.ObjectMeta{Name: "already-exists-update-error"},
 				GrantMethod: oauthv1.GrantHandlerPrompt,
 			},
+			oauthClientClient: newFakeOauthClientClient(func(fake *fakeoauthclient.Clientset) {
+				fake.PrependReactor("update", "oauthclients", reactorErrorFunc)
+			}),
 			wantUpdateErr: true,
 		},
 		{
 			name: "openshift-browser-client",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta:            metav1.ObjectMeta{Name: "openshift-browser-client"},
 				Secret:                base64.RawURLEncoding.EncodeToString(randomBits(256)),
 				RespondWithChallenges: false,
 				RedirectURIs:          []string{oauthdiscovery.OpenShiftOAuthTokenDisplayURL(masterPublicURL)},
 				GrantMethod:           oauthv1.GrantHandlerAuto,
 			},
+			oauthClientClient: newFakeOauthClientClient(nil),
 		},
 		{
 			name: "openshift-challenging-client",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta:            metav1.ObjectMeta{Name: "openshift-challenging-client"},
 				Secret:                "",
 				RespondWithChallenges: true,
 				RedirectURIs:          []string{oauthdiscovery.OpenShiftOAuthTokenImplicitURL(masterPublicURL)},
 				GrantMethod:           oauthv1.GrantHandlerAuto,
 			},
+			oauthClientClient: newFakeOauthClientClient(nil),
 		},
 		{
 			name: "openshift-cli-client",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta:   metav1.ObjectMeta{Name: "openshift-cli-client"},
 				RedirectURIs: []string{"http://127.0.0.1/callback", "http://[::1]/callback"},
 				GrantMethod:  oauthv1.GrantHandlerAuto,
 			},
+			oauthClientClient: newFakeOauthClientClient(nil),
 		},
 		{
 			name: "valid-oauth-client-minimal-client-grant-handler-auto",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta:  metav1.ObjectMeta{Name: "minimal-client-auto"},
 				GrantMethod: oauthv1.GrantHandlerAuto,
 			},
+			oauthClientClient: newFakeOauthClientClient(nil),
 		},
 		{
 			name: "valid-oauth-client-minimal-client-grant-handler-prompt",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta:  metav1.ObjectMeta{Name: "minimal-client-prompt"},
 				GrantMethod: oauthv1.GrantHandlerPrompt,
 			},
+			oauthClientClient: newFakeOauthClientClient(nil),
 		},
 		{
 			name: "valid-oauth-client-when-already-exists-without-updates",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta:            metav1.ObjectMeta{Name: "already-exists-without-updates"},
 				RespondWithChallenges: true,
 				RedirectURIs:          []string{"http://127.0.0.1/callback", "http://[::1]/callback"},
@@ -362,6 +399,7 @@ func Test_ensureOAuthClient(t *testing.T) {
 				},
 			},
 			updateOAuthClient: &oauthv1.OAuthClient{
+				ObjectMeta:            metav1.ObjectMeta{Name: "already-exists-with-updates"},
 				RespondWithChallenges: true,
 				RedirectURIs:          []string{"http://127.0.0.1/callback", "http://[::1]/callback"},
 				GrantMethod:           oauthv1.GrantHandlerAuto,
@@ -369,10 +407,11 @@ func Test_ensureOAuthClient(t *testing.T) {
 					{ExactValues: []string{"val1"}},
 				},
 			},
+			oauthClientClient: newFakeOauthClientClient(nil),
 		},
 		{
 			name: "valid-oauth-client-when-already-exists-with-updates",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta:            metav1.ObjectMeta{Name: "already-exists-with-updates"},
 				RespondWithChallenges: true,
 				RedirectURIs:          []string{"http://127.0.0.1/callback", "http://[::1]/callback"},
@@ -382,6 +421,7 @@ func Test_ensureOAuthClient(t *testing.T) {
 				},
 			},
 			updateOAuthClient: &oauthv1.OAuthClient{
+				ObjectMeta:            metav1.ObjectMeta{Name: "already-exists-with-updates"},
 				RespondWithChallenges: false,
 				RedirectURIs:          []string{"http://localhost/callback"},
 				GrantMethod:           oauthv1.GrantHandlerPrompt,
@@ -389,10 +429,11 @@ func Test_ensureOAuthClient(t *testing.T) {
 					{ExactValues: []string{"val2"}},
 				},
 			},
+			oauthClientClient: newFakeOauthClientClient(nil),
 		},
 		{
 			name: "valid-oauth-client-when-already-exists-with-updated-empty-secret",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta: metav1.ObjectMeta{Name: "already-exists-with-updated-empty-secret"},
 				Secret:     "secret",
 			},
@@ -402,7 +443,7 @@ func Test_ensureOAuthClient(t *testing.T) {
 		},
 		{
 			name: "valid-oauth-client-when-already-exists-with-updated-new-secret",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta: metav1.ObjectMeta{Name: "already-exists-with-updated-new-secret"},
 			},
 			updateOAuthClient: &oauthv1.OAuthClient{
@@ -411,7 +452,7 @@ func Test_ensureOAuthClient(t *testing.T) {
 		},
 		{
 			name: "valid-oauth-client-when-already-exists-with-updated-longer-secret",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta: metav1.ObjectMeta{Name: "already-exists-with-updated-longer-secret"},
 				Secret:     "secret",
 			},
@@ -421,7 +462,7 @@ func Test_ensureOAuthClient(t *testing.T) {
 		},
 		{
 			name: "valid-oauth-client-when-already-exists-with-updated-same-length-secret",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta: metav1.ObjectMeta{Name: "already-exists-with-updated-same-length-secret"},
 				Secret:     "secret",
 			},
@@ -431,7 +472,7 @@ func Test_ensureOAuthClient(t *testing.T) {
 		},
 		{
 			name: "valid-oauth-client-when-already-exists-with-updated-shorter-secret",
-			oauthClient: oauthv1.OAuthClient{
+			oauthClient: &oauthv1.OAuthClient{
 				ObjectMeta: metav1.ObjectMeta{Name: "already-exists-with-updated-shorter-secret"},
 				Secret:     "loooooooooooooongsecret",
 			},
@@ -441,11 +482,7 @@ func Test_ensureOAuthClient(t *testing.T) {
 		},
 	}
 
-	var reactorErrorFunc = func(action clienttesting.Action) (handled bool, ret runtime.Object, err error) {
-		return true, nil, fmt.Errorf("%s %s fake error", action.GetVerb(), action.GetResource().Resource)
-	}
-
-	ctx := context.TODO()
+	ctx := context.Background()
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			if tt.updateOAuthClient != nil && tt.updateOAuthClient.Secret != "" && len(tt.updateOAuthClient.Secret) <= len(tt.oauthClient.Secret) {
@@ -453,51 +490,34 @@ func Test_ensureOAuthClient(t *testing.T) {
 				t.SkipNow()
 			}
 
-			fakeClientset := fakeoauthclient.NewSimpleClientset()
-
-			// necessary reactor for ensureOAuthClient()
-			if tt.wantCreateErr {
-				fakeClientset.PrependReactor("create", "oauthclients", reactorErrorFunc)
-			}
-
 			c := newTestOAuthsClientsController(t)
-			c.oauthClientClient = fakeClientset.OauthV1().OAuthClients()
+			c.oauthClientClient = tt.oauthClientClient.OauthV1().OAuthClients()
 
-			err := ensureOAuthClient(ctx, c.oauthClientClient, tt.oauthClient)
-			if (err != nil) != tt.wantCreateErr {
-				t.Fatalf("got error: %v; want error: %v", err, tt.wantCreateErr)
-			}
-
-			if err != nil {
-				// do not continue the test if creation of the oauth client failed
+			err := ensureOAuthClient(ctx, c.oauthClientClient, *tt.oauthClient)
+			if got := err != nil; got != tt.wantEnsureErr {
+				t.Errorf("got error: %v; want error: %v", err, tt.wantEnsureErr)
 				return
 			}
 
-			assertOAuthClient(ctx, t, c, &tt.oauthClient)
-
-			// necessary reactors for ensureOAuthClient()->RetryOnConflict()
-			if tt.wantGetErr {
-				fakeClientset.PrependReactor("get", "oauthclients", reactorErrorFunc)
-			}
-
-			if tt.wantUpdateErr {
-				fakeClientset.PrependReactor("update", "oauthclients", reactorErrorFunc)
-			}
-
-			c.oauthClientClient = fakeClientset.OauthV1().OAuthClients()
 			if tt.updateOAuthClient != nil {
-				tt.updateOAuthClient.Name = tt.oauthClient.Name
 				err := ensureOAuthClient(ctx, c.oauthClientClient, *tt.updateOAuthClient)
-				if (err != nil) != (tt.wantGetErr || tt.wantUpdateErr) {
-					t.Fatalf("got error: %v; want error: %v", err, (tt.wantGetErr || tt.wantUpdateErr))
-				}
-
-				if err != nil {
-					// do not continue the test if update of the oauth client failed
+				if got := err != nil; got != tt.wantUpdateErr {
+					t.Errorf("got error: %v; want error: %v", err, tt.wantEnsureErr)
 					return
 				}
 
-				assertOAuthClient(ctx, t, c, tt.updateOAuthClient)
+				updatedClient, err := tt.oauthClientClient.Tracker().Get(
+					schema.GroupVersionResource{"oauth.openshift.io", "v1", "oauthclients"},
+					tt.updateOAuthClient.Namespace, tt.updateOAuthClient.Name,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+
+				if !equality.Semantic.DeepEqual(tt.updateOAuthClient, updatedClient) {
+					t.Errorf("updated client does not equal the expected one")
+					return
+				}
 			}
 		})
 	}
